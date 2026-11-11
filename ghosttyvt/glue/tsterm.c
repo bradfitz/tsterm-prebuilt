@@ -21,7 +21,7 @@
 // TSTERM_ABI_VERSION versions the contract with the Go side: the exported
 // functions, the imported ones, and the snapshot encoding. Increment it on
 // any incompatible change. build.sh copies it into version.go.
-#define TSTERM_ABI_VERSION 1
+#define TSTERM_ABI_VERSION 2
 
 #define IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define EXPORT(name) __attribute__((export_name(#name)))
@@ -29,6 +29,10 @@
 // write_pty delivers the terminal's replies to queries, which belong on
 // the PTY's input. id is the host's identifier for the terminal.
 IMPORT(write_pty) void host_write_pty(uint32_t id, const uint8_t* data, size_t len);
+
+// notify delivers a program's request for a desktop notification (OSC 9 or
+// OSC 777). The title may be empty.
+IMPORT(notify) void host_notify(uint32_t id, const uint8_t* title, size_t title_len, const uint8_t* body, size_t body_len);
 
 EXPORT(tsterm_abi_version) uint32_t tsterm_abi_version(void) { return TSTERM_ABI_VERSION; }
 
@@ -57,14 +61,22 @@ static void on_bell(GhosttyTerminal t, void* ud) {
   ((ctx*)ud)->bell++;
 }
 
-// setup configures a new terminal and the state for reading it.
-static ctx* setup(GhosttyTerminal term, uint32_t id) {
+static void on_notification(GhosttyTerminal t, void* ud, const GhosttyTerminalDesktopNotification* n) {
+  (void)t;
+  host_notify(((ctx*)ud)->id, n->title.ptr, n->title.len, n->body.ptr, n->body.len);
+}
+
+// setup configures a new or restored terminal and the state for reading it.
+static ctx* setup(GhosttyTerminal term, uint32_t id, uint64_t scrollback_bytes) {
   ctx* c = ghostty_wasm_alloc(sizeof(ctx));
   if (!c) return NULL;
   *c = (ctx){.term = term, .id = id};
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_USERDATA, c);
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (const void*)on_write_pty);
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_BELL, (const void*)on_bell);
+  ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, (const void*)on_notification);
+  size_t sb = (size_t)scrollback_bytes;
+  ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &sb);
   // A blinking block cursor by default, as in xterm.
   bool blink = true;
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK, &blink);
@@ -82,9 +94,7 @@ static ctx* setup(GhosttyTerminal term, uint32_t id) {
 EXPORT(tsterm_new) ctx* tsterm_new(uint32_t id, uint16_t cols, uint16_t rows, uint64_t scrollback_bytes) {
   GhosttyTerminal term = NULL;
   if (ghostty_terminal_new(NULL, &term, cols, rows) != GHOSTTY_SUCCESS) return NULL;
-  size_t sb = (size_t)scrollback_bytes;
-  ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &sb);
-  return setup(term, id);
+  return setup(term, id, scrollback_bytes);
 }
 
 EXPORT(tsterm_free) void tsterm_free(ctx* c) {
@@ -277,12 +287,12 @@ EXPORT(tsterm_checkpoint) uint8_t* tsterm_checkpoint(ctx* c) {
 }
 
 // tsterm_restore creates a terminal from a tsterm_checkpoint encoding.
-EXPORT(tsterm_restore) ctx* tsterm_restore(uint32_t id, const uint8_t* data, size_t len) {
+EXPORT(tsterm_restore) ctx* tsterm_restore(uint32_t id, const uint8_t* data, size_t len, uint64_t scrollback_bytes) {
   GhosttySnapshotDecoder dec = NULL;
   if (ghostty_snapshot_decoder_new_buf(NULL, &dec, data, len) != GHOSTTY_SUCCESS) return NULL;
   GhosttyTerminal term = NULL;
   GhosttyResult r = ghostty_snapshot_decoder_decode(dec, &term);
   ghostty_snapshot_decoder_free(dec);
   if (r != GHOSTTY_SUCCESS) return NULL;
-  return setup(term, id);
+  return setup(term, id, scrollback_bytes);
 }

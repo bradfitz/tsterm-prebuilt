@@ -5,7 +5,7 @@ package ghosttyvt
 // ABIVersion is the version of the contract between Wasm's glue and its Go
 // caller (TSTERM_ABI_VERSION in glue/tsterm.c). Wasm's tsterm_abi_version
 // export returns it too.
-const ABIVersion = 1
+const ABIVersion = 2
 
 // LibghosttyTag is the libghostty-vt release tag Wasm was built from.
 const LibghosttyTag = "vt-1.0.0"
