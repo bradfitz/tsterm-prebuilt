@@ -242,6 +242,21 @@ EXPORT(tsterm_snapshot) uint8_t* tsterm_snapshot(ctx* c) {
       ghostty_render_state_row_cells_get(c->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
       GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
       ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
+      // Cells erased with a background color set (as by EL or ED) have
+      // that color, but no style: it's in the cell itself.
+      GhosttyCellContentTag content = GHOSTTY_CELL_CONTENT_CODEPOINT;
+      ghostty_cell_get(raw, GHOSTTY_CELL_DATA_CONTENT_TAG, &content);
+      if (content == GHOSTTY_CELL_CONTENT_BG_COLOR_PALETTE) {
+        GhosttyColorPaletteIndex idx = 0;
+        ghostty_cell_get(raw, GHOSTTY_CELL_DATA_COLOR_PALETTE, &idx);
+        style.bg_color.tag = GHOSTTY_STYLE_COLOR_PALETTE;
+        style.bg_color.value.palette = idx;
+      } else if (content == GHOSTTY_CELL_CONTENT_BG_COLOR_RGB) {
+        GhosttyColorRgb rgb = {0};
+        ghostty_cell_get(raw, GHOSTTY_CELL_DATA_COLOR_RGB, &rgb);
+        style.bg_color.tag = GHOSTTY_STYLE_COLOR_RGB;
+        style.bg_color.value.rgb = rgb;
+      }
       put8(c, wide);
       put16(c, style.flags);
       putcolor(c, style.fg_color);
