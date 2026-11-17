@@ -21,7 +21,7 @@
 // TSTERM_ABI_VERSION versions the contract with the Go side: the exported
 // functions, the imported ones, and the snapshot encoding. Increment it on
 // any incompatible change. build.sh copies it into version.go.
-#define TSTERM_ABI_VERSION 3
+#define TSTERM_ABI_VERSION 4
 
 #define IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define EXPORT(name) __attribute__((export_name(#name)))
@@ -59,6 +59,11 @@ typedef struct {
   // viewport's height, while tsterm_history moves it (see row_ref).
   uint32_t vtop;
   uint16_t vrows;
+
+  // enc and key encode key events for tsterm_encode_key, and for
+  // reading the keyboard modes, for tsterm_snapshot.
+  GhosttyKeyEncoder enc;
+  GhosttyKeyEvent key;
 
   // out is the buffer tsterm_snapshot and tsterm_checkpoint return.
   uint8_t* out;
@@ -100,7 +105,9 @@ static ctx* setup(GhosttyTerminal term, uint32_t id, uint64_t scrollback_bytes) 
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES, &cont);
   if (ghostty_render_state_new(NULL, &c->rs) != GHOSTTY_SUCCESS ||
       ghostty_render_state_row_iterator_new(NULL, &c->rows) != GHOSTTY_SUCCESS ||
-      ghostty_render_state_row_cells_new(NULL, &c->cells) != GHOSTTY_SUCCESS) {
+      ghostty_render_state_row_cells_new(NULL, &c->cells) != GHOSTTY_SUCCESS ||
+      ghostty_key_encoder_new(NULL, &c->enc) != GHOSTTY_SUCCESS ||
+      ghostty_key_event_new(NULL, &c->key) != GHOSTTY_SUCCESS) {
     return NULL;
   }
   return c;
@@ -114,6 +121,8 @@ EXPORT(tsterm_new) ctx* tsterm_new(uint32_t id, uint16_t cols, uint16_t rows, ui
 
 EXPORT(tsterm_free) void tsterm_free(ctx* c) {
   if (!c) return;
+  ghostty_key_event_free(c->key);
+  ghostty_key_encoder_free(c->enc);
   ghostty_tracked_grid_ref_free(c->mark);
   ghostty_formatter_free(c->fmt);
   ghostty_render_state_row_cells_free(c->cells);
@@ -196,10 +205,42 @@ enum {
   MODE_FOCUS_EVENTS = 1 << 3,
   MODE_MOUSE_SGR = 1 << 4,
   MODE_CURSOR_VISIBLE = 1 << 5,
+  // MODE_MODIFY_OTHER_KEYS is set while xterm's modifyOtherKeys mode 2 is.
+  MODE_MODIFY_OTHER_KEYS = 1 << 6,
   // Bits 8-11 hold the mouse tracking mode: 0 off, 1 X10 (9), 2 normal
   // (1000), 3 button (1002), 4 any (1003).
   MODE_MOUSE_SHIFT = 8,
+  // Bits 16-23 hold the kitty keyboard protocol's flags
+  // (GhosttyKittyKeyFlags), 0 if it's off.
+  MODE_KITTY_KEYS_SHIFT = 16,
 };
+
+// encode encodes key with the terminal's keyboard modes into buf, of size
+// n, and returns the length of the encoding, or 0 if it has none or it
+// doesn't fit.
+static size_t encode(ctx* c, uint8_t* buf, size_t n) {
+  size_t written = 0;
+  ghostty_key_encoder_set_from_terminal(c->enc, c->term);
+  if (ghostty_key_encoder_encode(c->enc, c->key, buf, n, &written) != GHOSTTY_SUCCESS) return 0;
+  return written;
+}
+
+// modify_other_keys reports whether modifyOtherKeys mode 2 is on, which
+// the library has no getter for: while the kitty protocol is off, Ctrl-A
+// is then CSI 27;5;97~, rather than legacy's ^A.
+static bool modify_other_keys(ctx* c) {
+  static const uint8_t a[] = "a";
+  ghostty_key_event_set_action(c->key, GHOSTTY_KEY_ACTION_PRESS);
+  ghostty_key_event_set_key(c->key, GHOSTTY_KEY_A);
+  ghostty_key_event_set_mods(c->key, GHOSTTY_MODS_CTRL);
+  ghostty_key_event_set_consumed_mods(c->key, 0);
+  ghostty_key_event_set_utf8(c->key, (GhosttyString){.ptr = a, .len = 1});
+  ghostty_key_event_set_unshifted_codepoint(c->key, 'a');
+  uint8_t buf[16];
+  size_t n = encode(c, buf, sizeof buf);
+  ghostty_key_event_set_utf8(c->key, (GhosttyString){0});
+  return n > 1 && buf[0] == 0x1b;
+}
 
 // put_cell_style encodes a cell's width and style, the start of a cell's
 // encoding (see tsterm_snapshot).
@@ -262,6 +303,10 @@ EXPORT(tsterm_snapshot) uint8_t* tsterm_snapshot(ctx* c) {
   if (mode(c, 25)) modes |= MODE_CURSOR_VISIBLE;
   uint32_t mouse = mode(c, 1003) ? 4 : mode(c, 1002) ? 3 : mode(c, 1000) ? 2 : mode(c, 9) ? 1 : 0;
   modes |= mouse << MODE_MOUSE_SHIFT;
+  GhosttyKittyKeyFlags kitty = 0;
+  ghostty_terminal_get(c->term, GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS, &kitty);
+  modes |= (uint32_t)kitty << MODE_KITTY_KEYS_SHIFT;
+  if (!kitty && modify_other_keys(c)) modes |= MODE_MODIFY_OTHER_KEYS;
   put32(c, modes);
   put64(c, c->bell);
 
@@ -468,6 +513,30 @@ EXPORT(tsterm_history) uint8_t* tsterm_history(ctx* c) {
     set_mark(c, y);
   }
   if (c->vtop != sb) scroll_viewport(c, GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM, 0);
+  return c->out;
+}
+
+// tsterm_encode_key encodes a key event the way the program in the
+// terminal asked keys to be, as with the kitty keyboard protocol, into the
+// output buffer and returns it; its length is tsterm_out_len, 0 if the key
+// has no encoding. key is a GhosttyKey, and action a GhosttyKeyAction;
+// mods holds two GhosttyMods: the modifiers held, in its low 16 bits, and
+// in its high 16, those used to produce the text, such as Shift for "A".
+// utf8 is the text the key produced, without Ctrl's or Alt's effects, and
+// unshifted the codepoint it produces without Shift, if any.
+EXPORT(tsterm_encode_key) uint8_t* tsterm_encode_key(ctx* c, uint32_t key, uint32_t mods, uint8_t action, uint32_t unshifted, const uint8_t* utf8, size_t utf8_len) {
+  c->out_len = 0;
+  ghostty_key_event_set_action(c->key, (GhosttyKeyAction)action);
+  ghostty_key_event_set_key(c->key, (GhosttyKey)key);
+  ghostty_key_event_set_mods(c->key, (GhosttyMods)mods);
+  ghostty_key_event_set_consumed_mods(c->key, (GhosttyMods)(mods >> 16));
+  ghostty_key_event_set_utf8(c->key, (GhosttyString){.ptr = utf8, .len = utf8_len});
+  ghostty_key_event_set_unshifted_codepoint(c->key, unshifted);
+  uint8_t buf[128];
+  size_t n = encode(c, buf, sizeof buf);
+  // The event mustn't keep pointing at the host's bytes.
+  ghostty_key_event_set_utf8(c->key, (GhosttyString){0});
+  putbytes(c, buf, n);
   return c->out;
 }
 
