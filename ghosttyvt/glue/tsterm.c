@@ -21,7 +21,7 @@
 // TSTERM_ABI_VERSION versions the contract with the Go side: the exported
 // functions, the imported ones, and the snapshot encoding. Increment it on
 // any incompatible change. build.sh copies it into version.go.
-#define TSTERM_ABI_VERSION 4
+#define TSTERM_ABI_VERSION 5
 
 #define IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define EXPORT(name) __attribute__((export_name(#name)))
@@ -33,6 +33,19 @@ IMPORT(write_pty) void host_write_pty(uint32_t id, const uint8_t* data, size_t l
 // notify delivers a program's request for a desktop notification (OSC 9 or
 // OSC 777). The title may be empty.
 IMPORT(notify) void host_notify(uint32_t id, const uint8_t* title, size_t title_len, const uint8_t* body, size_t body_len);
+
+// program_status delivers a program status report (OSC 7501): state is a
+// GhosttyProgramStatusState, kind a GhosttyProgramStatusKind, progress 0
+// through 100 or -1, and the strings the record's id (empty for the
+// root), app, title, and message, already decoded. The host keeps the
+// records; the terminal doesn't.
+IMPORT(program_status) void host_program_status(uint32_t id, uint32_t state, uint32_t kind, int32_t progress,
+                                                const uint8_t* rid, size_t rid_len, const uint8_t* app, size_t app_len,
+                                                const uint8_t* title, size_t title_len, const uint8_t* msg, size_t msg_len);
+
+// prompt says that a shell started drawing its main prompt (OSC 133 A),
+// on which program status records of work in progress end.
+IMPORT(prompt) void host_prompt(uint32_t id);
 
 EXPORT(tsterm_abi_version) uint32_t tsterm_abi_version(void) { return TSTERM_ABI_VERSION; }
 
@@ -86,6 +99,19 @@ static void on_notification(GhosttyTerminal t, void* ud, const GhosttyTerminalDe
   host_notify(((ctx*)ud)->id, n->title.ptr, n->title.len, n->body.ptr, n->body.len);
 }
 
+static void on_program_status(GhosttyTerminal t, void* ud, const GhosttyTerminalProgramStatus* r) {
+  (void)t;
+  host_program_status(((ctx*)ud)->id, r->state, r->kind, r->progress, r->id.ptr, r->id.len, r->app.ptr, r->app.len,
+                      r->title.ptr, r->title.len, r->message.ptr, r->message.len);
+}
+
+static void on_semantic_prompt(GhosttyTerminal t, void* ud, const GhosttyTerminalSemanticPrompt* e) {
+  (void)t;
+  if (e->kind == GHOSTTY_SEMANTIC_PROMPT_PROMPT_START && e->prompt_kind == GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY) {
+    host_prompt(((ctx*)ud)->id);
+  }
+}
+
 // setup configures a new or restored terminal and the state for reading it.
 static ctx* setup(GhosttyTerminal term, uint32_t id, uint64_t scrollback_bytes) {
   ctx* c = ghostty_wasm_alloc(sizeof(ctx));
@@ -95,6 +121,10 @@ static ctx* setup(GhosttyTerminal term, uint32_t id, uint64_t scrollback_bytes) 
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (const void*)on_write_pty);
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_BELL, (const void*)on_bell);
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, (const void*)on_notification);
+  // Taking program status reports also makes the terminal answer
+  // programs that ask whether it does (OSC 7501 ; ?).
+  ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS, (const void*)on_program_status);
+  ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, (const void*)on_semantic_prompt);
   size_t sb = (size_t)scrollback_bytes;
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &sb);
   // A blinking block cursor by default, as in xterm.
