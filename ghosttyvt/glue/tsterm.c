@@ -21,7 +21,7 @@
 // TSTERM_ABI_VERSION versions the contract with the Go side: the exported
 // functions, the imported ones, and the snapshot encoding. Increment it on
 // any incompatible change. build.sh copies it into version.go.
-#define TSTERM_ABI_VERSION 5
+#define TSTERM_ABI_VERSION 6
 
 #define IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define EXPORT(name) __attribute__((export_name(#name)))
@@ -568,6 +568,30 @@ EXPORT(tsterm_encode_key) uint8_t* tsterm_encode_key(ctx* c, uint32_t key, uint3
   ghostty_key_event_set_utf8(c->key, (GhosttyString){0});
   putbytes(c, buf, n);
   return c->out;
+}
+
+// tsterm_history_on_screen returns how many of the lines tsterm_history
+// has returned are on the screen again: as the screen grows taller, the
+// terminal moves the last lines of its history back onto it. The host's
+// history then overlaps the screen by that many lines, which it should
+// not show twice.
+EXPORT(tsterm_history_on_screen) uint32_t tsterm_history_on_screen(ctx* c) {
+  if (!c->mark || !primary(c)) return 0;
+  size_t sb = 0;
+  ghostty_terminal_get(c->term, GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS, &sb);
+  ghostty_terminal_get(c->term, GHOSTTY_TERMINAL_DATA_ROWS, &c->vrows);
+  c->vtop = (uint32_t)sb; // the viewport is at the bottom
+  GhosttyPointCoordinate p = {0};
+  if (ghostty_tracked_grid_ref_point(c->mark, GHOSTTY_POINT_TAG_SCREEN, &p) != GHOSTTY_SUCCESS || p.y <= sb) {
+    return 0;
+  }
+  // Rows sb up to the mark are on the screen, in the viewport, and are
+  // whole lines, each ending in a row that doesn't wrap.
+  uint32_t lines = 0;
+  for (uint32_t y = (uint32_t)sb; y < p.y; y++) {
+    if (!row_wraps(c, y)) lines++;
+  }
+  return lines;
 }
 
 // tsterm_history_mark returns the screen row of the mark, the first row
